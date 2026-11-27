@@ -1,0 +1,66 @@
+#!/usr/bin/env python3
+import argparse
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+parser = argparse.ArgumentParser(description='Run the configured Antigravity advisor')
+parser.add_argument('--work', action='store_true', help='allow changes in the workspace')
+parser.add_argument('--dir', required=True, help='project directory')
+args = parser.parse_args()
+config_path = Path.home() / '.local/share/ai-collab/config.json'
+try:
+    config = json.loads(config_path.read_text())
+    agy = config['cli_paths']['agy']
+    if not isinstance(agy, str) or not agy.strip():
+        raise ValueError('cli_paths.agy 必须是非空路径或命令名')
+    role = config['roles']['gemini_advisor']
+    timeout = config['timeouts']['agy_seconds']
+    if role['provider'] != 'agy' or not isinstance(role['model'], str) or not role['model']:
+        raise ValueError('gemini_advisor provider/model 无效')
+    if role['effort'] not in ('low', 'medium', 'high', 'xhigh', 'max'):
+        raise ValueError('gemini_advisor effort 不在 agy --help 支持范围内')
+    if type(timeout) is not int or timeout <= 0:
+        raise ValueError('timeouts.agy_seconds 必须为正整数')
+    models = subprocess.run([agy, 'models'], capture_output=True, text=True, timeout=timeout, check=True)
+    ids = [line.split('\t')[0] for line in models.stdout.splitlines()]
+    if role['model'] not in ids:
+        raise ValueError('gemini_advisor model 不在 agy models 输出中')
+    family = role['model'].rsplit('-', 1)[0]
+    if family + '-' + role['effort'] not in ids or role['model'] != family + '-' + role['effort']:
+        raise ValueError('gemini_advisor model 与 effort 不一致，需使用 agy models 中对应档位的 ID')
+except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+    sys.exit(f'配置校验失败（{config_path}）：{exc}')
+work_dir = Path(args.dir).resolve()
+if not work_dir.is_dir():
+    sys.exit(f'目录不存在：{work_dir}')
+prompt = sys.stdin.read()
+if not prompt.strip():
+    sys.exit('请从标准输入提供提示词')
+if not args.work:
+    prompt = '材料已全部提供。仅根据下方输入进行审查，禁止调用任何工具、访问文件、运行命令或访问网络。材料不足时说明不足。\n\n' + prompt
+command = [agy, '--input-format', 'stream-json', '--output-format', 'stream-json',
+           '--model', role['model'], '--effort', role['effort'], '--print-timeout', f'{timeout}s']
+message = json.dumps({'event': 'user', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': prompt}]}}, ensure_ascii=False) + '\n'
+if args.work:
+    command += ['--mode', 'accept-edits']
+else:
+    profile = '(version 1)(allow default)(deny file-write* (subpath ' + json.dumps(str(work_dir)) + '))'
+    command = ['/usr/bin/sandbox-exec', '-p', profile] + command + ['--mode', 'plan']
+try:
+    result = subprocess.run(command, cwd=work_dir, input=message, capture_output=True, text=True, timeout=timeout + 5)
+    if result.stderr:
+        sys.stderr.write(result.stderr)
+    if result.returncode:
+        sys.stderr.write(result.stdout)
+        sys.exit(result.returncode)
+    events = [json.loads(line) for line in result.stdout.splitlines()]
+    data = next(event['result'] for event in reversed(events) if event.get('event') == 'result')
+    if data.get('denied_actions'):
+        sys.exit(f'agy 工具请求被拒绝：{data["denied_actions"]}')
+    if data['status'] != 'SUCCESS' or not isinstance(data['response'], str) or not data['response'].strip():
+        sys.exit(f'agy 未成功完成：{result.stdout}')
+    sys.stdout.write(data['response'])
+except (OSError, ValueError, KeyError, StopIteration, subprocess.TimeoutExpired) as exc:
+    sys.exit(f'agy 执行失败：{exc}')

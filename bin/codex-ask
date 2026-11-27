@@ -1,0 +1,58 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+parser = argparse.ArgumentParser(description='Run a configured Codex reviewer or independent worker')
+mode = parser.add_mutually_exclusive_group()
+mode.add_argument('--work', action='store_true', help='use the configured worker')
+mode.add_argument('--hard', action='store_true', help='use the configured hard worker')
+parser.add_argument('--dir', required=True, help='project directory')
+args = parser.parse_args()
+config_path = Path.home() / '.local/share/ai-collab/config.json'
+cache_path = Path.home() / '.codex/models_cache.json'
+role_name = 'codex_worker_hard' if args.hard else 'codex_worker' if args.work else 'codex_architect_audit'
+try:
+    config = json.loads(config_path.read_text())
+    codex = config['cli_paths']['codex']
+    if not isinstance(codex, str) or not codex.strip():
+        raise ValueError('cli_paths.codex 必须是非空路径或命令名')
+    role = config['roles'][role_name]
+    timeout = config['timeouts']['codex_seconds']
+    models = json.loads(cache_path.read_text())['models']
+    if role['provider'] != 'codex' or not isinstance(role['model'], str) or not isinstance(role['effort'], str):
+        raise ValueError(f'{role_name} provider/model/effort 无效')
+    model = next((m for m in models if m['slug'] == role['model']), None)
+    if not model or role['effort'] not in [level['effort'] for level in model['supported_reasoning_levels']]:
+        raise ValueError(f"{role_name} 模型或思考强度不在 {cache_path} 中")
+    if type(timeout) is not int or timeout <= 0:
+        raise ValueError('timeouts.codex_seconds 必须为正整数')
+except (OSError, ValueError, KeyError, TypeError) as exc:
+    sys.exit(f'配置无效（{config_path}）：{exc}')
+if not Path(args.dir).is_dir():
+    sys.exit(f'目录不存在：{args.dir}')
+prompt = sys.stdin.read()
+if not prompt.strip():
+    sys.exit('请从标准输入提供提示词')
+command = [codex, 'exec', '-C', os.path.abspath(args.dir), '-s',
+           'workspace-write' if args.work or args.hard else 'read-only',
+           '-m', role['model'], '-c', 'model_reasoning_effort=' + json.dumps(role['effort']),
+           '--skip-git-repo-check']
+try:
+    with tempfile.TemporaryDirectory() as temp:
+        output = Path(temp) / 'last-message.txt'
+        result = subprocess.run(command + ['-o', str(output), '-'], input=prompt, text=True,
+                                stdout=subprocess.DEVNULL, timeout=timeout)
+        if result.returncode:
+            sys.exit(result.returncode)
+        if not output.is_file():
+            sys.exit('codex 未返回最终答复')
+        sys.stdout.write(output.read_text())
+except subprocess.TimeoutExpired:
+    sys.exit(f'codex 超时（{timeout} 秒）')
+except OSError as exc:
+    sys.exit(f'codex 启动失败：{exc}')

@@ -1,0 +1,4 @@
+{
+  "name": "ai-collab-panel",
+  "description": "多模型协同调度侧边栏面板：可视化配置 Antigravity 与 Codex 各角色模型与思考强度，并查看交接与晨报状态"
+}

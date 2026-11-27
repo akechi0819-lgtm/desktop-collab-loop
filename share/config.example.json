@@ -1,0 +1,33 @@
+{
+  "roles": {
+    "gemini_advisor": {
+      "provider": "agy",
+      "model": "gemini-4-neon-high",
+      "effort": "high"
+    },
+    "codex_architect_audit": {
+      "provider": "codex",
+      "model": "gpt-6.2-astra",
+      "effort": "medium"
+    },
+    "codex_worker": {
+      "provider": "codex",
+      "model": "gpt-6.2-sol",
+      "effort": "medium"
+    },
+    "codex_worker_hard": {
+      "provider": "codex",
+      "model": "gpt-6.2-astra",
+      "effort": "high"
+    }
+  },
+  "timeouts": {
+    "agy_seconds": 300,
+    "codex_seconds": 900
+  },
+  "max_review_rounds": 2,
+  "cli_paths": {
+    "agy": "agy",
+    "codex": "codex"
+  }
+}

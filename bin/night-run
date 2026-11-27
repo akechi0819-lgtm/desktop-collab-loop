@@ -1,0 +1,210 @@
+#!/usr/bin/env python3
+import argparse
+import datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import signal
+import subprocess
+import sys
+import time
+
+parser = argparse.ArgumentParser(description='夜间协作：交接文本需包含“测试命令: <命令>”')
+parser.add_argument('--mode', choices=['resume', 'new'], required=True)
+parser.add_argument('--ui', action='store_true', help='使用 Antigravity 施工')
+parser.add_argument('--hard', action='store_true', help='使用 Codex 高难度 worker')
+parser.add_argument('project')
+args = parser.parse_args()
+if sys.platform == 'darwin' and not os.environ.get('AI_COLLAB_CAFFEINATED'):
+    os.environ['AI_COLLAB_CAFFEINATED'] = '1'
+    os.execvp('caffeinate', ['caffeinate', '-i', sys.executable, __file__, *sys.argv[1:]])
+
+origin = Path(args.project).expanduser().resolve()
+collab = origin / '.local/collab'
+collab.mkdir(parents=True, exist_ok=True)
+lock = (collab / 'night-run.lock').open('a')
+try:
+    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    print(f'启动失败：项目已有夜间任务运行：{origin}', file=sys.stderr)
+    sys.exit(1)
+log = collab / 'night-run.log'
+handoff = collab / 'handoff.md' if args.mode == 'resume' else None
+step = '准备'
+
+def record(message):
+    line = f'[{datetime.datetime.now().astimezone().isoformat(timespec="seconds")}] {message}'
+    with log.open('a') as f:
+        f.write(line + '\n')
+    print(line, flush=True)
+
+def run(command, cwd, timeout, input_text=None, shell=False):
+    record(f'{step}：{command if isinstance(command, str) else " ".join(command)}')
+    process = subprocess.Popen(command, cwd=cwd, stdin=subprocess.PIPE if input_text is not None else None,
+                               text=True, errors='replace', stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               shell=shell, start_new_session=True)
+    try:
+        stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.communicate()
+        raise
+    with log.open('a') as f:
+        f.write(stdout + '\n' + stderr + '\n')
+    if process.returncode:
+        raise RuntimeError(f'退出码 {process.returncode}，详见 {log}')
+    return stdout
+
+try:
+    step = '读取配置'
+    config_path = Path.home() / '.local/share/ai-collab/config.json'
+    try:
+        config = json.loads(config_path.read_text())
+        timeout = config['timeouts']['codex_seconds']
+        agy_timeout = config['timeouts']['agy_seconds']
+        rounds = config['max_review_rounds']
+        if type(timeout) is not int or timeout <= 0 or type(agy_timeout) is not int or agy_timeout <= 0 or type(rounds) is not int or not 1 <= rounds <= 2:
+            raise ValueError('超时或审查轮数无效')
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise ValueError(f'配置无效 {config_path}: {exc}') from exc
+    step = '检查 Git 项目'
+    root = Path(run(['git', 'rev-parse', '--show-toplevel'], origin, 30).strip()).resolve()
+    if origin != root:
+        raise ValueError('项目目录必须是 Git 工作区根目录')
+    exclude = Path(run(['git', 'rev-parse', '--git-path', 'info/exclude'], origin, 30).strip())
+    if not exclude.is_absolute():
+        exclude = origin / exclude
+    if '.local/collab/' not in exclude.read_text().splitlines():
+        with exclude.open('a') as f:
+            f.write('\n.local/collab/\n')
+    if args.mode == 'new':
+        step = '读取新任务需求'
+        request = sys.stdin.read().strip()
+        if not request:
+            raise ValueError('new 模式需要从 stdin 提供交接需求和测试命令')
+        commit = run(['git', 'rev-parse', 'HEAD'], origin, 30).strip()
+        work = origin.parent / f'{origin.name}-night-{time.strftime("%Y%m%d-%H%M%S")}-{os.getpid()}'
+        step = '创建 worktree'
+        run(['git', 'worktree', 'add', '--detach', str(work), commit], origin, timeout)
+        handoff = work / '.local/collab/handoff.md'
+        handoff.parent.mkdir(parents=True, exist_ok=True)
+        handoff.write_text(f'# 夜间交接\n\n工作目录: {work}\n起点 commit: {commit}\n\n{request}\n')
+    else:
+        work = origin
+        handoff = work / '.local/collab/handoff.md'
+    step = '读取交接'
+    content = handoff.read_text()
+    start_match = re.search(r'^[ \t]*起点\s*(?:commit|提交)[ \t]*[:：][ \t]*(.*)$', content, re.M | re.I)
+    step = '确认起点 commit'
+    revision = start_match.group(1).strip().strip('`') if start_match else 'HEAD'
+    if start_match and not re.fullmatch(r'[0-9a-fA-F]{7,40}', revision):
+        raise ValueError('交接中的起点 commit 应为实际提交哈希')
+    start = run(['git', 'rev-parse', '--verify', revision + '^{commit}'], work, 30).strip()
+    if not start_match:
+        with handoff.open('a') as f:
+            f.write(f'\n起点 commit: {start}\n')
+    step = '读取交接'
+    match = re.search(r'^\s*测试命令\s*[:：]\s*(\S.*)$', content, re.M)
+    if not match:
+        raise ValueError('handoff.md 缺少“测试命令: <命令>”')
+    test_command = match.group(1).strip().strip('`')
+    step = '记录未跟踪文件起始状态'
+    initial_untracked = run(['git', 'ls-files', '--others', '--exclude-standard', '-z'], work, 30).split('\0')
+    initial_stats = {p: ((work / p).lstat().st_size, (work / p).lstat().st_mtime_ns) for p in initial_untracked if p}
+    receipt = {'mode': args.mode, 'started_at': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
+               'work_dir': str(work), 'handoff_path': str(handoff), 'log_path': str(log), 'pid': os.getpid()}
+    receipt_tmp = collab / f'latest-run.{os.getpid()}.tmp'
+    receipt_tmp.write_text(json.dumps(receipt, ensure_ascii=False, indent=2) + '\n')
+    receipt_tmp.replace(collab / 'latest-run.json')
+    record('已接手：' + json.dumps(receipt, ensure_ascii=False))
+    def append(text):
+        with handoff.open('a') as f:
+            f.write('\n' + text.rstrip() + '\n')
+    def ask(cmd, prompt, limit):
+        return run([str(Path.home() / '.local/bin' / cmd[0]), *cmd[1:], '--dir', str(work)], work, limit + 10, prompt)
+    step = '读取审查模板'
+    audit_template = (Path.home() / '.local/share/ai-collab/audit-prompt.md').read_text()
+    common = f'工作目录 {work}。先阅读 {handoff}，以及存在的 prd.md、spec.md；关注整个工作区，包括未跟踪文件。'
+    audit_common = common + '\n' + audit_template
+    worker = ['agy-ask', '--work'] if args.ui else ['codex-ask', '--hard' if args.hard else '--work']
+    step = '施工'
+    ask(worker, common + '完成交接中的剩余任务；只在 handoff.md 追加施工记录，不要编写或修改晨报、测试和联审区；不要嵌套委派。', agy_timeout if args.ui else timeout)
+    for review_round in range(1, rounds + 1):
+        step = f'第 {review_round} 轮测试'
+        output = run(test_command, work, timeout, shell=True)
+        append(f'## 第 {review_round} 轮测试通过\n\n命令: `{test_command}`\n\n```\n{output.rstrip()}\n```')
+        step = f'第 {review_round} 轮 Codex 技术审查'
+        technical = ask(['codex-ask'], audit_common + '对照交接和规格审查 Bug、数据、权限和接口契约，给出行号或复现路径。存在必须修复的问题时每条以 BLOCKER 开头；否则明确写 NO BLOCKER。不要修改文件。', timeout)
+        if not re.search(r'^\s*(?:[-*]\s*)?BLOCKER\b|^\s*NO BLOCKER\s*$', technical, re.M | re.I):
+            raise ValueError('审查输出缺少明确 BLOCKER 或 NO BLOCKER，详见日志')
+        step = f'第 {review_round} 轮准备需求审查材料'
+        diff = run(['git', 'diff', '--no-ext-diff', '--no-textconv', start, '--'], work, timeout)
+        untracked = run(['git', 'ls-files', '--others', '--exclude-standard', '-z'], work, timeout).split('\0')
+        notes = []
+        def read_text(relative):
+            path = work / relative
+            if not path.exists() and not path.is_symlink():
+                return None
+            if path.resolve() != path.absolute() or not path.is_file():
+                notes.append(f'{relative}: 跳过符号链接或非普通文件')
+                return None
+            data = path.read_bytes()
+            if b'\0' in data:
+                notes.append(f'{relative}: 二进制文件，未提供正文')
+                return None
+            try:
+                return data.decode('utf-8')
+            except UnicodeDecodeError:
+                notes.append(f'{relative}: 非 UTF-8 文本，未提供正文')
+                return None
+        docs = []
+        paths = ['prd.md', 'spec.md', '.local/collab/prd.md', '.local/collab/spec.md']
+        references = handoff.read_text()
+        for path in paths:
+            text = read_text(path)
+            if text is not None:
+                docs.append(f'\n--- {path} ---\n{text}\n')
+                references += '\n' + text
+        for path in untracked:
+            if not path or path in paths:
+                continue
+            stat = (work / path).lstat()
+            changed = initial_stats.get(path) != (stat.st_size, stat.st_mtime_ns)
+            if changed or path in references or Path(path).name in references:
+                text = read_text(path)
+                if text is not None:
+                    docs.append(f'\n--- {path} ---\n{text}\n')
+        step = f'第 {review_round} 轮 Antigravity 需求审查'
+        product_prompt = (audit_template + '\n只依据以下 stdin 材料审查需求偏离、冗余抽象、过度防御和交互问题；'
+                          '不要调用任何工具或读取文件。材料不足时说明无法判断，不能假装已完整审查。'
+                          '存在必须修复的问题时每条以 BLOCKER 开头；否则单独写 NO BLOCKER。不要修改文件。'
+                          f'\n工作目录：{work}\n起点 commit：{start}\n\n交接：\n{handoff.read_text()}'
+                          f'\n起点至工作区的 Git diff（含已提交、暂存及未暂存变更）：\n{diff}'
+                          f'\n未跟踪文件清单（正文仅含新增、修改或交接/规格引用的文件）：\n{chr(10).join(untracked)}'
+                          f'\n需求文档及未跟踪文本正文：{chr(10).join(docs)}\n材料限制：{chr(10).join(notes) or "无"}')
+        product = ask(['agy-ask'], product_prompt, agy_timeout)
+        if not re.search(r'^\s*(?:[-*]\s*)?BLOCKER\b|^\s*NO BLOCKER\s*$', product, re.M | re.I):
+            raise ValueError('审查输出缺少明确 BLOCKER 或 NO BLOCKER，详见日志')
+        append(f'## 第 {review_round} 轮联审\n\n### 技术审查\n{technical}\n\n### 需求审查\n{product}')
+        blockers = [x for x in (technical, product) if re.search(r'^\s*(?:[-*]\s*)?BLOCKER\b', x, re.M | re.I)]
+        if not blockers:
+            step = '生成晨报'
+            summary = ask(['agy-ask'], '不要调用任何工具。根据以下交接原文（包含测试和双方审查），用三句白话概括完成内容、测试结果、用户需要关注的事；只输出这三句。\n\n' + handoff.read_text(), agy_timeout)
+            append('## 晨报\n\n' + summary)
+            record('完成，晨报已写入 ' + str(handoff))
+            break
+        if review_round == rounds:
+            append('## 待验收\n\n达到联审轮数上限，仍有 BLOCKER，保留现场。')
+            record('待验收：仍有 BLOCKER')
+            break
+        step = f'第 {review_round} 轮定点修复'
+        ask(worker, common + '只修复以下 BLOCKER，只在 handoff.md 追加施工记录，不要编写或修改晨报、测试和联审区；不要嵌套委派：\n' + '\n'.join(blockers), agy_timeout if args.ui else timeout)
+except (OSError, ValueError, KeyError, subprocess.TimeoutExpired, RuntimeError) as exc:
+    reason = f'停止：{step}；{exc}'
+    if handoff and handoff.exists():
+        with handoff.open('a') as f:
+            f.write('\n' + reason + '\n')
+    record(reason)
+    sys.exit(1)
