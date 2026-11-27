@@ -2,12 +2,14 @@
 import argparse
 import json
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 
 parser = argparse.ArgumentParser(description='Run the configured Antigravity advisor')
 parser.add_argument('--work', action='store_true', help='allow changes in the workspace')
 parser.add_argument('--dir', required=True, help='project directory')
+parser.add_argument('--ref', action='append', default=[], help='external reference file to stage into .local/collab/refs/')
 args = parser.parse_args()
 config_path = Path.home() / '.local/share/ai-collab/config.json'
 try:
@@ -35,11 +37,33 @@ except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as
 work_dir = Path(args.dir).resolve()
 if not work_dir.is_dir():
     sys.exit(f'目录不存在：{work_dir}')
+staged_refs = []
+if args.ref:
+    refs_dir = work_dir / '.local/collab/refs'
+    refs_dir.mkdir(parents=True, exist_ok=True)
+    for raw_ref in args.ref:
+        src = Path(raw_ref).expanduser().resolve()
+        if not src.is_file():
+            sys.exit(f'参考文件不存在：{src}')
+        dst = refs_dir / src.name
+        idx = 2
+        while dst.exists() and dst.resolve() != src:
+            dst = refs_dir / f'{src.stem}-{idx}{src.suffix}'
+            idx += 1
+        if dst.resolve() != src:
+            shutil.copy2(src, dst)
+        staged_refs.append(dst)
 prompt = sys.stdin.read()
 if not prompt.strip():
     sys.exit('请从标准输入提供提示词')
+if staged_refs:
+    ref_list = '\n'.join(f'- {p}' for p in staged_refs)
+    prompt = f'参考文件已归集到当前工作区内（请直接读取以下路径）：\n{ref_list}\n\n' + prompt
 if not args.work:
-    prompt = '材料已全部提供。仅根据下方输入进行审查，禁止调用任何工具、访问文件、运行命令或访问网络。材料不足时说明不足。\n\n' + prompt
+    if staged_refs:
+        prompt = '只读审查模式：请只用内置文件阅读工具查看下方已归集的参考文件，禁止修改任何文件、运行终端命令或访问网络。\n\n' + prompt
+    else:
+        prompt = '材料已全部提供。仅根据下方输入进行审查，禁止调用任何工具、访问文件、运行命令或访问网络。材料不足时说明不足。\n\n' + prompt
 command = [agy, '--input-format', 'stream-json', '--output-format', 'stream-json',
            '--model', role['model'], '--effort', role['effort'], '--print-timeout', f'{timeout}s']
 message = json.dumps({'event': 'user', 'message': {'role': 'user', 'content': [{'type': 'text', 'text': prompt}]}}, ensure_ascii=False) + '\n'
