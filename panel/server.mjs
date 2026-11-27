@@ -1,11 +1,14 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+
+const execFileAsync = promisify(execFile);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const APP_URI = 'ui://ai-collab/panel.html';
@@ -83,13 +86,30 @@ function loadCodexModels(currentConfig) {
   return { source: 'codex_cache', models };
 }
 
-function loadAgyModels(currentConfig) {
+async function loadAgyModels(currentConfig, { refresh = false } = {}) {
   const agyBin = currentConfig.cli_paths.agy;
+  const cachePath = process.env.AI_COLLAB_MODELS_CACHE || path.join(os.homedir(), '.local/share/ai-collab/agy-models-cache.json');
   const currentModel = currentConfig.roles.gemini_advisor.model;
   const knownEfforts = new Set(['low', 'medium', 'high', 'xhigh', 'max']);
 
+  const ensureCurrent = (models) => {
+    if (!models.some((m) => m.id === currentModel)) {
+      models.unshift({ id: currentModel, label: currentModel, efforts: ['low', 'medium', 'high'] });
+    }
+    return models;
+  };
+
+  if (!refresh && fs.existsSync(cachePath)) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+      if (Array.isArray(cached?.models) && cached.models.length > 0) {
+        return { source: 'agy_cli', cachedAt: cached.cachedAt, models: ensureCurrent([...cached.models]) };
+      }
+    } catch {}
+  }
+
   try {
-    const out = execFileSync(agyBin, ['models'], { encoding: 'utf8', timeout: 10000 });
+    const { stdout: out } = await execFileAsync(agyBin, ['models'], { encoding: 'utf8', timeout: 10000 });
     const rawItems = [];
     const familyEfforts = new Map();
     for (const rawLine of out.split('\n')) {
@@ -120,13 +140,24 @@ function loadAgyModels(currentConfig) {
       return { id, label, efforts: effs };
     });
     if (parsed.length > 0) {
-      if (!parsed.some((m) => m.id === currentModel)) {
-        parsed.unshift({ id: currentModel, label: currentModel, efforts: ['low', 'medium', 'high'] });
-      }
-      return { source: 'agy_cli', models: parsed };
+      const cachedAt = new Date().toISOString();
+      try {
+        fs.mkdirSync(path.dirname(cachePath), { recursive: true });
+        fs.writeFileSync(cachePath, `${JSON.stringify({ cachedAt, models: parsed }, null, 2)}\n`, 'utf8');
+      } catch {}
+      return { source: 'agy_cli', cachedAt, models: ensureCurrent(parsed) };
     }
   } catch {
-    // agy CLI not installed yet or not logged in; fall back cleanly.
+    // Fall back to existing cache or current model cleanly.
+  }
+
+  if (fs.existsSync(cachePath)) {
+    try {
+      const cached = JSON.parse(fs.readFileSync(cachePath, 'utf8'));
+      if (Array.isArray(cached?.models) && cached.models.length > 0) {
+        return { source: 'agy_cli', cachedAt: cached.cachedAt, models: ensureCurrent([...cached.models]) };
+      }
+    } catch {}
   }
 
   return {
@@ -192,7 +223,7 @@ function loadCodexUsage() {
   return { available: false, reason: '未在近期 Codex 会话中找到限额快照' };
 }
 
-function loadAntigravityUsage(currentConfig) {
+async function loadAntigravityUsage(currentConfig, { refresh = false } = {}) {
   const quotaPath = process.env.AI_COLLAB_QUOTA_PATH || path.join(os.homedir(), '.local/share/ai-collab/antigravity-quota.json');
   const percent = z.number().min(0).max(100);
   const resetTs = z.number().nullable().optional();
@@ -208,10 +239,18 @@ function loadAntigravityUsage(currentConfig) {
     gemini: groupSchema,
     claudeGpt: groupSchema,
   });
+
+  if (!refresh && fs.existsSync(quotaPath)) {
+    try {
+      const cached = schema.parse(JSON.parse(fs.readFileSync(quotaPath, 'utf8')));
+      return { available: true, ...cached };
+    } catch {}
+  }
+
   let refreshError;
   try {
     const agyBin = currentConfig.cli_paths.agy;
-    const output = execFileSync(agyBin, ['-p', '/usage', '--output-format', 'json', '--print-timeout', '15s'], { encoding: 'utf8', timeout: 20000 });
+    const { stdout: output } = await execFileAsync(agyBin, ['-p', '/usage', '--output-format', 'json', '--print-timeout', '15s'], { encoding: 'utf8', timeout: 20000 });
     const result = JSON.parse(output);
     if (result.status !== 'SUCCESS' || result.command?.name !== 'usage') throw new Error('无法识别 /usage 输出');
     const groups = result.command.data.groups;
@@ -300,10 +339,13 @@ function loadProjectStatus(projectDir) {
   };
 }
 
-function buildState(projectDir) {
+async function buildState(projectDir, { refresh = false } = {}) {
   const config = readConfig();
   const codexCatalog = loadCodexModels(config);
-  const agyCatalog = loadAgyModels(config);
+  const [agyCatalog, antigravityUsage] = await Promise.all([
+    loadAgyModels(config, { refresh }),
+    loadAntigravityUsage(config, { refresh }),
+  ]);
   return {
     configPath: OPTS.configPath,
     isSample: IS_SAMPLE,
@@ -314,7 +356,7 @@ function buildState(projectDir) {
     },
     usage: {
       codex: loadCodexUsage(),
-      antigravity: loadAntigravityUsage(config),
+      antigravity: antigravityUsage,
     },
     project: loadProjectStatus(projectDir),
   };
@@ -364,7 +406,7 @@ server.registerTool(
     },
   },
   async ({ project_dir }) => {
-    const state = buildState(project_dir);
+    const state = await buildState(project_dir, { refresh: false });
     return {
       content: [
         {
@@ -416,7 +458,7 @@ server.registerTool(
       }
     }
     writeConfigAtomic({ ...readConfig(), roles: normalized, timeouts, max_review_rounds });
-    const state = buildState(project_dir);
+    const state = await buildState(project_dir, { refresh: false });
     return {
       content: [{ type: 'text', text: `已保存配置到 ${state.configPath}` }],
       structuredContent: state,
@@ -431,11 +473,12 @@ server.registerTool(
     description: '重新读取本机模型列表、各 Harness 用量快照与指定项目的交接状态',
     inputSchema: {
       project_dir: z.string().optional(),
+      refresh: z.boolean().optional(),
     },
     _meta: { ui: { visibility: ['app'] } },
   },
-  async ({ project_dir }) => {
-    const state = buildState(project_dir);
+  async ({ project_dir, refresh }) => {
+    const state = await buildState(project_dir, { refresh: refresh !== false });
     return {
       content: [{ type: 'text', text: `已刷新（项目状态：${state.project.status}）` }],
       structuredContent: state,

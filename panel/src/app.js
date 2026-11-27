@@ -12,12 +12,14 @@ const ROLE_META = [
   { key: 'codex_worker_hard', name: '疑难攻坚 Worker', accent: 'accent-hard', tag: 'Codex 攻坚', desc: '跨文件归属不清、复杂逻辑或疑难 Bug' },
 ];
 
-const app = new App({ name: 'ai-collab-panel', version: '0.2.0' }, {});
+const app = new App({ name: 'ai-collab-panel', version: '0.3.0' }, {});
 let state = null;
 let draft = null;
 let dirty = false;
 let toast = { text: '就绪', kind: '' };
 let saving = false;
+let refreshing = false;
+let autoRefreshedOnce = false;
 
 function cloneConfig(cfg) {
   return JSON.parse(JSON.stringify(cfg));
@@ -107,7 +109,7 @@ function renderCodexQuotaCard(u) {
   ` : '';
 
   return `
-    <div class="quota-card codex">
+    <div class="quota-card codex ${refreshing ? 'refreshing' : ''}">
       <div class="quota-top">
         <span class="quota-name">Codex</span>
         <span class="quota-plan">${escapeHtml(planLabel)}</span>
@@ -151,7 +153,7 @@ function renderAgyQuotaCard(u) {
   const cgReset = u.claudeGpt?.weeklyResetAt ? `周重置 ${formatResetTime(u.claudeGpt.weeklyResetAt)}` : '';
 
   return `
-    <div class="quota-card agy">
+    <div class="quota-card agy ${refreshing ? 'refreshing' : ''}">
       <div class="quota-top">
         <span class="quota-name">Antigravity</span>
         <span class="quota-plan">AI Pro</span>
@@ -229,14 +231,19 @@ function render() {
       </div>
       <div class="topbar-right">
         <span class="pill ${state.isSample ? 'warn' : 'ok'}">${state.isSample ? '样例配置' : '正式配置'}</span>
-        <button id="btn-refresh" type="button" class="icon-btn" ${saving ? 'disabled' : ''}>刷新</button>
+        <button id="btn-refresh" type="button" class="icon-btn" ${saving || refreshing ? 'disabled' : ''}>
+          <svg class="spin-icon ${refreshing ? 'spinning' : ''}" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M13.5 8a5.5 5.5 0 1 1-1.3-3.6M13.5 2.5v2.9h-2.9"/>
+          </svg>
+          <span>${refreshing ? '刷新中…' : '刷新'}</span>
+        </button>
       </div>
     </div>
 
     <div>
       <div class="sec-head">
         <span class="sec-title">Harness 用量与状态</span>
-        <span class="sec-sub">本机实时读取</span>
+        <span class="sec-sub">${refreshing ? '正在同步最新额度…' : '本地缓存秒开 · 点刷新同步'}</span>
       </div>
       <div class="quota-grid">
         ${renderCodexQuotaCard(state.usage?.codex)}
@@ -358,10 +365,10 @@ function render() {
   });
 
   document.getElementById('btn-save')?.addEventListener('click', handleSave);
-  document.getElementById('btn-refresh')?.addEventListener('click', () => handleRefresh());
+  document.getElementById('btn-refresh')?.addEventListener('click', () => handleRefresh(undefined, { refresh: true }));
   document.getElementById('btn-load-project')?.addEventListener('click', () => {
     const p = document.getElementById('inp-project-dir')?.value?.trim() || '';
-    handleRefresh(p);
+    handleRefresh(p, { refresh: false });
   });
   document.getElementById('btn-open-handoff')?.addEventListener('click', async () => {
     if (!proj.handoffPath) return;
@@ -406,22 +413,26 @@ async function handleSave() {
   }
 }
 
-async function handleRefresh(projectDir) {
+async function handleRefresh(projectDir, { refresh = true, silent = false } = {}) {
+  if (refreshing) return;
+  refreshing = true;
+  if (!silent) toast = { text: refresh ? '正在同步最新模型与用量…' : '正在读取项目交接…', kind: '' };
+  render();
   try {
     const targetDir = projectDir ?? document.getElementById('inp-project-dir')?.value?.trim() ?? state?.project?.projectDir ?? '';
     const res = await app.callServerTool({
       name: 'load_project_status',
-      arguments: { project_dir: targetDir || undefined },
+      arguments: { project_dir: targetDir || undefined, refresh },
     });
     if (res?.structuredContent) {
       state = res.structuredContent;
-      draft = cloneConfig(state.config);
-      dirty = false;
-      toast = { text: '已重新读取模型与用量快照', kind: 'ok' };
-      render();
+      if (!dirty) draft = cloneConfig(state.config);
+      toast = { text: refresh ? '已更新最新额度与模型' : '已切换项目视图', kind: 'ok' };
     }
   } catch (err) {
     toast = { text: `刷新失败：${err?.message || err}`, kind: 'err' };
+  } finally {
+    refreshing = false;
     render();
   }
 }
@@ -433,6 +444,12 @@ app.ontoolresult = (result) => {
     dirty = false;
     toast = { text: '就绪', kind: '' };
     render();
+    const sampledAt = state.usage?.antigravity?.sampledAt;
+    const stale = !sampledAt || (Date.now() - Date.parse(sampledAt) > 3 * 60 * 1000);
+    if (stale && !autoRefreshedOnce) {
+      autoRefreshedOnce = true;
+      handleRefresh(undefined, { refresh: true, silent: true });
+    }
   }
 };
 
