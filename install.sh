@@ -37,7 +37,7 @@ install_file() {
     echo "已安装: $destination"
   fi
 }
-for name in agy-ask codex-ask night-run; do
+for name in agy-ask codex-ask night-run collab-history; do
   install_file "$root/bin/$name" "$HOME/.local/bin/$name"
 done
 for name in audit-prompt.md handoff-template.md; do

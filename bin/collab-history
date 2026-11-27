@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+import argparse
+import datetime
+import json
+from pathlib import Path
+import re
+import sys
+import time
+
+AGY_ROOT = Path.home() / '.gemini/antigravity/brain'
+CODEX_ROOT = Path.home() / '.codex/sessions'
+
+
+def clean_text(text):
+    text = re.sub(r'<ADDITIONAL_METADATA>[\s\S]*?</ADDITIONAL_METADATA>', '', text)
+    text = re.sub(r'<USER_SETTINGS_CHANGE>[\s\S]*?</USER_SETTINGS_CHANGE>', '', text)
+    text = re.sub(r'</?USER_REQUEST>', '', text)
+    return text.strip()
+
+
+def read_agy_turns(path):
+    turns = []
+    for line in path.read_text(errors='ignore').splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        kind = obj.get('type')
+        raw = obj.get('content', '')
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        if kind == 'USER_INPUT':
+            txt = clean_text(raw)
+            if txt and not txt.startswith('The following is a <SYSTEM_MESSAGE>'):
+                turns.append(('user', txt))
+        elif kind == 'PLANNER_RESPONSE':
+            txt = raw.strip()
+            if txt:
+                turns.append(('assistant', txt))
+    return turns
+
+
+def read_codex_turns(path):
+    turns = []
+    for line in path.read_text(errors='ignore').splitlines():
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            continue
+        if obj.get('type') != 'response_item':
+            continue
+        payload = obj.get('payload')
+        if not isinstance(payload, dict) or payload.get('type') != 'message':
+            continue
+        role = payload.get('role')
+        if role not in ('user', 'assistant'):
+            continue
+        parts = [
+            c.get('text', '')
+            for c in payload.get('content', [])
+            if isinstance(c, dict) and c.get('type') in ('input_text', 'output_text')
+        ]
+        txt = '\n'.join(p for p in parts if p).strip()
+        if not txt:
+            continue
+        if role == 'user' and (txt.startswith('# AGENTS.md') or txt.startswith('<environment_context>')):
+            continue
+        turns.append((role, txt))
+    return turns
+
+
+def collect_sessions(source, days):
+    cutoff = time.time() - days * 86400 if days > 0 else 0
+    items = []
+    if source in ('all', 'agy') and AGY_ROOT.is_dir():
+        for tpath in AGY_ROOT.glob('*/.system_generated/logs/transcript.jsonl'):
+            mtime = tpath.stat().st_mtime
+            if mtime >= cutoff:
+                items.append(('agy', tpath.parents[2].name, mtime, tpath))
+    if source in ('all', 'codex') and CODEX_ROOT.is_dir():
+        for rpath in CODEX_ROOT.rglob('*.jsonl'):
+            mtime = rpath.stat().st_mtime
+            if mtime >= cutoff:
+                m = re.search(r'([0-9a-f]{8}-[0-9a-f-]{27})$', rpath.stem)
+                sid = m.group(1) if m else rpath.stem
+                items.append(('codex', sid, mtime, rpath))
+    items.sort(key=lambda x: x[2], reverse=True)
+    return items
+
+
+def load_turns(src, path):
+    return read_agy_turns(path) if src == 'agy' else read_codex_turns(path)
+
+
+def clip(text, max_chars):
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    return text[:max_chars].rstrip() + '…'
+
+
+def format_session(src, sid, mtime, turns, max_chars):
+    ts = datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')
+    lines = [f'## [{src}] {sid} ({ts}, {len(turns)} turns)', '']
+    for role, txt in turns:
+        label = '用户' if role == 'user' else ('Antigravity' if src == 'agy' else 'Codex')
+        lines.append(f'- **{label}**：{clip(txt.replace(chr(10), " "), max_chars)}')
+    return '\n'.join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='跨 Antigravity 与 Codex 只读检索本机历史对话')
+    parser.add_argument('--query', '-q', default='', help='按关键词筛选（空格分隔多个词，全部命中）')
+    parser.add_argument('--source', choices=['all', 'agy', 'codex'], default='all', help='限定来源')
+    parser.add_argument('--days', type=int, default=7, help='最近天数，0 表示不限（默认 7）')
+    parser.add_argument('--limit', type=int, default=10, help='最多返回条数（默认 10）')
+    parser.add_argument('--show', help='按会话 ID 前缀导出单条完整对话')
+    parser.add_argument('--export', action='store_true', help='直接导出命中会话的精简对话正文')
+    parser.add_argument('--max-chars', type=int, default=500, help='每条消息最大字符数，0 为不截断（默认 500）')
+    args = parser.parse_args()
+
+    sessions = collect_sessions(args.source, 0 if args.show else args.days)
+    if args.show:
+        needle = args.show.lower()
+        for src, sid, mtime, path in sessions:
+            if sid.lower().startswith(needle) or needle in sid.lower():
+                turns = load_turns(src, path)
+                print(format_session(src, sid, mtime, turns, args.max_chars))
+                return
+        sys.exit(f'未找到匹配的会话 ID：{args.show}')
+
+    keywords = [k.lower() for k in args.query.split() if k.strip()]
+    matched = []
+    for src, sid, mtime, path in sessions:
+        turns = load_turns(src, path)
+        if not turns:
+            continue
+        if keywords:
+            haystack = '\n'.join(t for _, t in turns).lower()
+            if not all(k in haystack for k in keywords):
+                continue
+        matched.append((src, sid, mtime, turns))
+        if len(matched) >= args.limit:
+            break
+
+    if not matched:
+        print('未找到符合条件的历史对话。')
+        return
+
+    if args.export:
+        print('\n\n'.join(format_session(s, i, m, t, args.max_chars) for s, i, m, t in matched))
+        return
+
+    for src, sid, mtime, turns in matched:
+        ts = datetime.datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M')
+        u_cnt = sum(1 for r, _ in turns if r == 'user')
+        a_cnt = len(turns) - u_cnt
+        first_u = next((t for r, t in turns if r == 'user'), turns[0][1]).replace('\n', ' ')
+        print(f'- `[{src}]` `{sid[:8]}` | {ts} | {u_cnt}U/{a_cnt}A | {clip(first_u, 90)}')
+
+
+if __name__ == '__main__':
+    main()
